@@ -85,7 +85,7 @@ PRESETS = {
         "blade_cm_radius": 0.15,
         "blade_chord": 0.03,
         "motor_type": "DC børste",
-        "motor_resistance": 2.0,
+        "motor_resistance": 0.5,
     },
     "Small Hobby (500W)": {
         "designer_radius": 1.0,
@@ -100,7 +100,7 @@ PRESETS = {
         "blade_cm_radius": 0.5,
         "blade_chord": 0.05,
         "motor_type": "3-fase",
-        "motor_resistance": 1.5,
+        "motor_resistance": 0.2,
     },
     "Medium Hobby (2kW)": {
         "designer_radius": 2.0,
@@ -115,7 +115,7 @@ PRESETS = {
         "blade_cm_radius": 1.0,
         "blade_chord": 0.1,
         "motor_type": "3-fase",
-        "motor_resistance": 0.8,
+        "motor_resistance": 0.1,
     },
     "Modern (45% Cp)": {
         "designer_radius": 1.5,
@@ -130,7 +130,7 @@ PRESETS = {
         "blade_cm_radius": 0.75,
         "blade_chord": 0.15,
         "motor_type": "3-fase",
-        "motor_resistance": 0.5,
+        "motor_resistance": 0.05,
     },
 }
 
@@ -172,7 +172,7 @@ DEFAULTS = {
     "gear_ratio": 2.0,
     "v_drop": 0.64,
     "motor_type": "3-fase",
-    "motor_resistance": 1.0,
+    "motor_resistance": 0.2,
     "rho": RHO_DEFAULT,
     "blade_mass": 1.0,
     "blade_cm_radius": 0.15,
@@ -391,25 +391,8 @@ else:
 
 st.sidebar.subheader("Elektriske Konstanter")
 
-# Note om motor efficiency
-st.sidebar.info("⚠️ **Note:** Motor nyttevirkning varierer i virkeligheden med RPM og belastning (torque). Slideren nedenfor er en forenkling som antager konstant efficiency.")
-
-motor_efficiency = st.sidebar.slider(
-    "Motors MPP nyttevirkning (%) - Forenkling",
-    min_value=10,
-    max_value=99,
-    value=int(st.session_state.motor_efficiency_pct),
-    step=1,
-    key="motor_efficiency_pct",
-    help=TOOLTIPS["motor_efficiency"]
-) / 100
-
-if motor_efficiency < 0.5:
-    st.sidebar.warning("⚠️ Meget lav motoreffektivitet (under 50%)")
-elif motor_efficiency >= 0.85:
-    st.sidebar.success("✅ Høj effektivitet - professionel generator")
-else:
-    st.sidebar.info("ℹ️ Acceptabel effektivitet for hobby projekter")
+# Motor efficiency er nu 100% - alle elektriske tab beregnes direkte via I²R
+motor_efficiency = 1.0  # Alle tab beregnes nu eksplicit (diode + I²R)
 
 tip_speed_ratio = st.sidebar.slider(
     "Tip Speed Ratio (λ)",
@@ -475,9 +458,9 @@ else:  # DC børste
 motor_resistance = st.sidebar.number_input(
     "Motor ledningsmodstand (R) [Ω]",
     min_value=0.01,
-    max_value=10.0,
+    max_value=5.0,
     value=float(st.session_state.motor_resistance),
-    step=0.1,
+    step=0.05,
     format="%.2f",
     key="motor_resistance",
     help=TOOLTIPS["motor_resistance"]
@@ -848,23 +831,23 @@ def calculate_power_after_diodes(v_rms, v_drop_val, i_rms, motor_resistance):
     return max(0, p_after_diodes - copper_loss)
 
 def calculate_loss_percentage(p_mech, p_elec_before_diodes, i_rms, v_drop, motor_resistance):
-    """Beregn energitab i procent og watt - beregner diode tab og I²R tab direkte"""
-    if p_mech == 0:
-        return 0, 0, 0, 0, 0, 0
+    """Beregn energitab i procent og watt - beregner diode tab og I²R tab direkte
     
-    # Motor tab: forskel mellem mekanisk og elektrisk effekt
-    motor_loss_watts = p_mech - p_elec_before_diodes
-    motor_loss_pct = (motor_loss_watts / p_mech) * 100
+    Nu med motor_efficiency = 100%, så p_elec_before_diodes = p_mech
+    Alle tab kommer fra diode og I²R
+    """
+    if p_mech == 0 or p_elec_before_diodes == 0:
+        return 0, 0, 0, 0, 0
     
     # Diode tab i watt: P_diode = V_drop × I
     diode_loss_watts = v_drop * i_rms
-    diode_loss_pct = (diode_loss_watts / p_elec_before_diodes) * 100 if p_elec_before_diodes > 0 else 0
+    diode_loss_pct = (diode_loss_watts / p_elec_before_diodes) * 100
     
     # Kobber tab i watt: P_copper = I² × R
     copper_loss_watts = i_rms**2 * motor_resistance
-    copper_loss_pct = (copper_loss_watts / p_elec_before_diodes) * 100 if p_elec_before_diodes > 0 else 0
+    copper_loss_pct = (copper_loss_watts / p_elec_before_diodes) * 100
     
-    return motor_loss_pct, diode_loss_pct, copper_loss_pct, motor_loss_watts, diode_loss_watts, copper_loss_watts
+    return diode_loss_pct, copper_loss_pct, diode_loss_watts, copper_loss_watts
 
 # FYSIK BEREGNINGSFUNKTIONER
 def calculate_torque(power, rpm):
@@ -1075,26 +1058,22 @@ i_rms_data = [calculate_rms_current(p_elec, v_rms) for p_elec, v_rms in zip(p_el
 p_diodes_data = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance) 
                  for v_rms, i_rms in zip(v_rms_data, i_rms_data)]
 
-# Beregn energitab
-motor_losses = []
+# Beregn energitab (diode og I²R tab)
 diode_losses = []
 copper_losses = []
-motor_losses_watts = []
 diode_losses_watts = []
 copper_losses_watts = []
 for i, v in enumerate(wind_speeds):
     # Beregn tab direkte fra strøm, spænding og modstand
-    m_loss, d_loss, c_loss, m_watts, d_watts, c_watts = calculate_loss_percentage(
+    d_loss, c_loss, d_watts, c_watts = calculate_loss_percentage(
         p_mech_selected[i], 
         p_elec_before_selected[i], 
         i_rms_data[i], 
         v_drop, 
         motor_resistance
     )
-    motor_losses.append(m_loss)
     diode_losses.append(d_loss)
     copper_losses.append(c_loss)
-    motor_losses_watts.append(m_watts)
     diode_losses_watts.append(d_watts)
     copper_losses_watts.append(c_watts)
 
@@ -1621,7 +1600,6 @@ with tab4:
         'P_diode_tab [W]': [f"{d:.2f}" for d in diode_losses_watts],
         'P_I²R_tab [W]': [f"{c:.2f}" for c in copper_losses_watts],
         'P_total_tab [W]': [f"{d+c:.2f}" for d, c in zip(diode_losses_watts, copper_losses_watts)],
-        'Motor_loss [%]': [f"{m:.1f}" for m in motor_losses],
         'Diode_loss [%]': [f"{d:.1f}" for d in diode_losses],
         'I²R_loss [%]': [f"{c:.1f}" for c in copper_losses],
         'dB': [f"{db:.1f}" for db in noise_levels],
