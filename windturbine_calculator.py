@@ -84,6 +84,8 @@ PRESETS = {
         "blade_mass": 0.3,
         "blade_cm_radius": 0.15,
         "blade_chord": 0.03,
+        "motor_type": "DC børste",
+        "motor_resistance": 2.0,
     },
     "Small Hobby (500W)": {
         "designer_radius": 1.0,
@@ -97,6 +99,8 @@ PRESETS = {
         "blade_mass": 1.0,
         "blade_cm_radius": 0.5,
         "blade_chord": 0.05,
+        "motor_type": "3-fase",
+        "motor_resistance": 1.5,
     },
     "Medium Hobby (2kW)": {
         "designer_radius": 2.0,
@@ -110,6 +114,8 @@ PRESETS = {
         "blade_mass": 3.0,
         "blade_cm_radius": 1.0,
         "blade_chord": 0.1,
+        "motor_type": "3-fase",
+        "motor_resistance": 0.8,
     },
     "Modern (45% Cp)": {
         "designer_radius": 1.5,
@@ -123,6 +129,8 @@ PRESETS = {
         "blade_mass": 5.0,
         "blade_cm_radius": 0.75,
         "blade_chord": 0.15,
+        "motor_type": "3-fase",
+        "motor_resistance": 0.5,
     },
 }
 
@@ -134,6 +142,8 @@ TOOLTIPS = {
     "tsr": "Forholdet mellem vingespids hastighed og vindhastighed. Optimal TSR for moderne møller er 6-8.",
     "kv": "Motor konstant der relaterer RPM til spænding. Typisk 0.005-0.01 for vindmøller.",
     "gear_ratio": "Gearudveksling mellem rotor og generator. Højere gear = højere RPM, men lavere moment.",
+    "motor_type": "3-fase motor bruger 3-fase ligeretterbro (2 dioder i serie, ~1.4V tab). DC børste motor bruger typisk ingen/1 diode (~0.0-0.7V tab).",
+    "motor_resistance": "Motor/generator viklingens modstand i Ohm. Forårsager I²R tab (kobber tab). Måles mellem 2 terminaler.",
 }
 
 # KOMMERCIELLE MØLLER DATABASE
@@ -161,6 +171,8 @@ DEFAULTS = {
     "kv_value": 0.0074,
     "gear_ratio": 2.0,
     "v_drop": 0.64,
+    "motor_type": "3-fase",
+    "motor_resistance": 1.0,
     "rho": RHO_DEFAULT,
     "blade_mass": 1.0,
     "blade_cm_radius": 0.15,
@@ -436,14 +448,36 @@ gear_ratio = st.sidebar.slider(
     help=TOOLTIPS["gear_ratio"]
 )
 
-v_drop = st.sidebar.slider(
-    "Diode spændingsfald (V)",
-    min_value=0.1,
-    max_value=1.5,
-    value=float(st.session_state.v_drop),
-    step=0.01,
-    key="v_drop"
+# Motortype valg
+motor_type = st.sidebar.radio(
+    "Generator/Motor Type",
+    ["3-fase", "DC børste"],
+    index=0 if st.session_state.motor_type == "3-fase" else 1,
+    key="motor_type",
+    help=TOOLTIPS["motor_type"]
 )
+
+# Automatisk beregning af diode spændingsfald baseret på motortype
+if motor_type == "3-fase":
+    v_drop = 1.4  # 2 dioder i serie i 3-fase bro
+    st.sidebar.info("ℹ️ Diode tab: ~1.4V (3-fase bro, 2 dioder)")
+else:  # DC børste
+    v_drop = 0.7  # 1 diode eller ingen
+    st.sidebar.info("ℹ️ Diode tab: ~0.7V (1 beskyttelsesdiode)")
+
+# Motor modstand
+motor_resistance = st.sidebar.number_input(
+    "Motor ledningsmodstand (R) [Ω]",
+    min_value=0.01,
+    max_value=10.0,
+    value=float(st.session_state.motor_resistance),
+    step=0.1,
+    format="%.2f",
+    key="motor_resistance",
+    help=TOOLTIPS["motor_resistance"]
+)
+
+st.sidebar.caption("💡 Måles mellem 2 faseteminaler (3-fase) eller mellem + og - (DC)")
 
 # Avancerede indstillinger
 st.sidebar.subheader("Avancerede Indstillinger")
@@ -600,6 +634,8 @@ settings_payload = {
     "tip_speed_ratio": float(tip_speed_ratio),
     "kv_value": float(kv),
     "gear_ratio": float(gear_ratio),
+    "motor_type": motor_type,
+    "motor_resistance": float(motor_resistance),
     "v_drop": float(v_drop),
     "rho": float(rho),
     "blade_mass": float(blade_mass),
@@ -793,18 +829,35 @@ def calculate_rms_current(p_elec, v_rms):
         return 0
     return p_elec / v_rms
 
-def calculate_power_after_diodes(v_rms, v_drop_val, i_rms):
-    """Beregn effekt efter dioder: (V - V_drop) * I"""
-    v_effective = max(0, v_rms - v_drop_val)
-    return v_effective * i_rms
+def calculate_copper_loss(i_rms, motor_resistance):
+    """Beregn I²R tab i motor ledninger (kobber tab)"""
+    return i_rms**2 * motor_resistance
 
-def calculate_loss_percentage(p_mech, p_elec_before_diodes, p_after_diodes):
-    """Beregn energitab i procent"""
+def calculate_power_after_diodes(v_rms, v_drop_val, i_rms, motor_resistance):
+    """Beregn effekt efter dioder og kobber tab: (V - V_drop) * I - I²R"""
+    v_effective = max(0, v_rms - v_drop_val)
+    p_after_diodes = v_effective * i_rms
+    # Træk I²R tab fra
+    copper_loss = calculate_copper_loss(i_rms, motor_resistance)
+    return max(0, p_after_diodes - copper_loss)
+
+def calculate_loss_percentage(p_mech, p_elec_before_diodes, i_rms, v_drop, motor_resistance):
+    """Beregn energitab i procent - beregner diode tab og I²R tab direkte"""
     if p_mech == 0:
-        return 0, 0
+        return 0, 0, 0
+    
+    # Motor tab: forskel mellem mekanisk og elektrisk effekt
     motor_loss = ((p_mech - p_elec_before_diodes) / p_mech) * 100
-    diode_loss = ((p_elec_before_diodes - p_after_diodes) / p_mech) * 100 if p_elec_before_diodes > 0 else 0
-    return motor_loss, diode_loss
+    
+    # Diode tab i watt: P_diode = V_drop × I
+    diode_loss_watts = v_drop * i_rms
+    diode_loss_pct = (diode_loss_watts / p_mech) * 100
+    
+    # Kobber tab i watt: P_copper = I² × R
+    copper_loss_watts = i_rms**2 * motor_resistance
+    copper_loss_pct = (copper_loss_watts / p_mech) * 100
+    
+    return motor_loss, diode_loss_pct, copper_loss_pct
 
 # FYSIK BEREGNINGSFUNKTIONER
 def calculate_torque(power, rpm):
@@ -983,8 +1036,8 @@ v_rms_data_betz = [calculate_rms_voltage(rpm, kv, gear_ratio) for rpm in rpm_dat
 # Beregn RMS strøm
 i_rms_data_betz = [calculate_rms_current(p_elec, v_rms) for p_elec, v_rms in zip(p_elec_before_diodes_betz, v_rms_data_betz)]
 
-# Beregn effekt efter dioder
-p_after_diodes_betz = [calculate_power_after_diodes(v_rms, v_drop, i_rms) 
+# Beregn effekt efter dioder og kobber tab
+p_after_diodes_betz = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance) 
                        for v_rms, i_rms in zip(v_rms_data_betz, i_rms_data_betz)]
 
 # Vælg mølletype til detaljeret analyse
@@ -1012,19 +1065,25 @@ else:
 rpm_data = [calculate_rpm_from_wind_speed(v, radius, tip_speed_ratio) for v in wind_speeds]
 v_rms_data = [calculate_rms_voltage(rpm, kv, gear_ratio) for rpm in rpm_data]
 i_rms_data = [calculate_rms_current(p_elec, v_rms) for p_elec, v_rms in zip(p_elec_before_selected, v_rms_data)]
-p_diodes_data = [calculate_power_after_diodes(v_rms, v_drop, i_rms) 
+p_diodes_data = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance) 
                  for v_rms, i_rms in zip(v_rms_data, i_rms_data)]
 
 # Beregn energitab
 motor_losses = []
 diode_losses = []
+copper_losses = []
 for i, v in enumerate(wind_speeds):
-    # Beregn effekt før dioder
-    p_before = p_elec_before_selected[i]
-    p_after = p_diodes_data[i]
-    m_loss, d_loss = calculate_loss_percentage(p_mech_selected[i], p_before, p_after)
+    # Beregn tab direkte fra strøm, spænding og modstand
+    m_loss, d_loss, c_loss = calculate_loss_percentage(
+        p_mech_selected[i], 
+        p_elec_before_selected[i], 
+        i_rms_data[i], 
+        v_drop, 
+        motor_resistance
+    )
     motor_losses.append(m_loss)
     diode_losses.append(d_loss)
+    copper_losses.append(c_loss)
 
 # BEREGN FYSIK PARAMETRE
 # Torque beregninger
@@ -1169,6 +1228,12 @@ with tab1:
             y=diode_losses,
             name='Diode tab (%)',
             hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Diode tab</b>: %{y:.2f}%<extra></extra>'
+        ))
+        fig_loss1.add_trace(go.Bar(
+            x=wind_speeds,
+            y=copper_losses,
+            name='I²R Kobber tab (%)',
+            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Kobber tab</b>: %{y:.2f}%<extra></extra>'
         ))
         fig_loss1.update_layout(
             title=f'Energitab for {turbine_name} mølle',
@@ -1529,6 +1594,9 @@ with tab4:
         'P_mech [W]': [f"{p:.1f}" for p in p_mech_selected],
         'M [Nm]': [f"{t:.3f}" for t in torques_selected],
         'P_elec [W]': [f"{p:.1f}" for p in p_elec_before_selected],
+        'Motor_loss [%]': [f"{m:.1f}" for m in motor_losses],
+        'Diode_loss [%]': [f"{d:.1f}" for d in diode_losses],
+        'I²R_loss [%]': [f"{c:.1f}" for c in copper_losses],
         'dB': [f"{db:.1f}" for db in noise_levels],
         'Re': [f"{re:.0f}" for re in reynolds_numbers],
         'F_c [N]': [f"{f:.2f}" for f in centrifugal_forces],
@@ -1574,6 +1642,7 @@ with tab4:
             
             **📊 Motor tab:** {motor_losses[idx]:.1f}%  
             **📊 Diode tab:** {diode_losses[idx]:.1f}%  
+            **📊 I²R Kobber tab:** {copper_losses[idx]:.1f}%  
             **✅ Samlet effektivitet:** {efficiency_total[idx]:.1f}%
             """)
     
@@ -1699,6 +1768,8 @@ with tab5:
                 'radius': float(radius),
                 'cp': float(cp_selected),
                 'motor_efficiency': float(motor_efficiency),
+                'motor_type': motor_type,
+                'motor_resistance': float(motor_resistance),
                 'tsr': float(tip_speed_ratio),
                 'avg_power': float(0.5 * rho * PI * radius**2 * 5**3 * cp_selected),
             }
