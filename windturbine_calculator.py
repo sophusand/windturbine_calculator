@@ -437,6 +437,9 @@ gear_ratio = st.sidebar.slider(
 
 st.sidebar.info("💡 **Gear forhold:** Hvis du gearer op (gear>1): RPM_motor = RPM_blade × gear, men Torque_motor = Torque_blade / gear. Effekt P_mech = Torque × ω forbliver konstant.")
 
+if gear_ratio < 1.5:
+    st.sidebar.warning("⚠️ **Lav gear ratio!** Ved gear < 1.5: Lav voltage, høj strøm → store I²R tab. Anbefaling: Brug gear 2-4x for bedre effektivitet.")
+
 # Motortype valg
 motor_type = st.sidebar.radio(
     "Generator/Motor Type",
@@ -467,6 +470,10 @@ motor_resistance = st.sidebar.number_input(
 )
 
 st.sidebar.caption("💡 Måles mellem 2 faseteminaler (3-fase) eller mellem + og - (DC)")
+
+# Advarsel hvis modstand er for høj
+if motor_resistance > 1.0:
+    st.sidebar.warning("⚠️ Høj modstand! Kan give store I²R tab og lav effektivitet.")
 
 # Avancerede indstillinger
 st.sidebar.subheader("Avancerede Indstillinger")
@@ -1211,6 +1218,11 @@ with tab1:
         # Beregn total tab i watt (diode + I²R)
         total_losses_watts = [d + c for d, c in zip(diode_losses_watts, copper_losses_watts)]
         
+        # Tjek om tab er større end tilgængelig effekt
+        max_loss_pct = max([d + c for d, c in zip(diode_losses, copper_losses)]) if diode_losses and copper_losses else 0
+        if max_loss_pct > 100:
+            st.warning(f"⚠️ **Advarsel:** Kombinerede tab (diode + I²R) er op til {max_loss_pct:.0f}% af P_elec! Motoren kan ikke levere effekt under disse forhold. Øg gear ratio eller sænk motor modstand.")
+        
         fig_loss_watts = go.Figure()
         fig_loss_watts.add_trace(go.Scatter(
             x=wind_speeds,
@@ -1253,9 +1265,22 @@ with tab1:
         efficiency_total = []
         for p_mech, p_after in zip(p_mech_selected, p_diodes_data):
             if p_mech > 0:
-                efficiency_total.append((p_after / p_mech) * 100)
+                eff = (p_after / p_mech) * 100
+                efficiency_total.append(eff)  # Brug faktisk værdi (kan være negativ)
             else:
                 efficiency_total.append(0)
+        
+        # Tjek om effektiviteten er for lav (tab er for store)
+        max_efficiency = max(efficiency_total) if efficiency_total else 0
+        avg_efficiency = sum(efficiency_total) / len(efficiency_total) if efficiency_total else 0
+        
+        if max_efficiency < 0:
+            st.error("❌ **Kritisk:** Tab overstiger effekt! Modellen antager ubegrænset strøm-kapacitet, hvilket ikke er realistisk.")
+            st.info("💡 **Hvis din mølle fungerer i virkeligheden:** Systemet finder et equilibrium med lavere strøm. Mål faktiske værdier (V_out, I_out) i stedet.")
+        elif max_efficiency < 5:
+            st.warning("⚠️ **Advarsel:** Meget lav nyttevirkning! Tab (diode + I²R) er for store. Prøv at: ↑ Geareforhold, ↓ Motor modstand")
+        elif avg_efficiency < 15:
+            st.info("ℹ️ **Note:** Lav nyttevirkning. Overvej højere gear ratio eller lavere motor modstand.")
         
         fig_eff = go.Figure()
         fig_eff.add_trace(go.Scatter(
@@ -1268,12 +1293,17 @@ with tab1:
             marker=dict(size=8),
             hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Nyttevirkning</b>: %{y:.2f}%<extra></extra>'
         ))
+        
+        # Sæt y-akse range fornuftigt (tillad negative værdier)
+        y_min = min(-10, min(efficiency_total) * 1.1) if efficiency_total and min(efficiency_total) < 0 else 0
+        y_max = max(100, max_efficiency * 1.2) if max_efficiency > 0 else 100
+        
         fig_eff.update_layout(
             title=f'Total Nyttevirkning for {turbine_name} mølle',
             xaxis_title='Vindhastighed [m/s]',
             yaxis_title='Total Nyttevirkning [%]',
             height=500,
-            yaxis=dict(range=[0, max(efficiency_total) * 1.1] if efficiency_total else [0, 100]),
+            yaxis=dict(range=[y_min, y_max]),
             hovermode='x unified'
         )
         st.plotly_chart(fig_eff, use_container_width=True)
@@ -1808,9 +1838,15 @@ st.markdown("""
 - Alle beregninger er baseret på **ideelle forhold** uden tab fra friktion, luftmodstand på tårn, etc.
 - Lufttæthed (ρ) er sat til **1.225 kg/m³** som standard (havniveau, 15°C)
 - RPM beregnes ud fra **Tip Speed Ratio** og **gearudveksling**
-- Elektrisk effekt inkluderer **motor-effektivitet**
-- Effekt efter dioder reduceres med **spændingsfald** over dioden
+- Elektrisk effekt beregnes som P_mech × motor_efficiency (før diode/I²R tab)
+- **Diode tab:** P_diode = V_drop × I (lineært med strøm)
+- **I²R tab:** P_copper = I² × R_motor (kvadratisk med strøm)
 - **Betz grænse** (59.3%) er det teoretiske maksimum for vindenergiudnyttelse
+
+### ⚠️ Model Begrænsninger:
+- **Antager ubegrænset strøm-kapacitet**: Ved meget lave voltager/høje modstande kan modellen forudsige urealistisk høje strømme og tab
+- **Hvis nyttevirkning er negativ**: Modellen er ikke præcis under disse forhold. I virkeligheden vil systemet finde et equilibrium med lavere strøm
+- **Anbefaling for ekstreme konfigurationer**: Mål faktiske værdier (V_out, I_out, P_out) i stedet for at stole på teoretiske beregninger
 
 ---
 **Udviklet med ❤️ | Windturbine Calculator v2.0**
