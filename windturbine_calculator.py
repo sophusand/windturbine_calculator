@@ -190,6 +190,8 @@ DEFAULTS = {
     "turbine_type": "Moderne vindmølle",
     "selected_commercial": list(commercial_turbines.keys())[0],
     "selected_wind": 1.0,
+    "auto_optimize_enabled": False,
+    "target_wind_speed": 10.0,
 }
 
 def init_session_state(defaults):
@@ -237,6 +239,211 @@ def get_text(key):
     """Hent oversættelse baseret på valgt sprog"""
     lang = st.session_state.get("language", "da")
     return TRANSLATIONS.get(lang, TRANSLATIONS["da"]).get(key, key)
+
+# =============================================================================
+# BEREGNINGSFUNKTIONER - Defineret før UI kode så de kan bruges i sidebar
+# =============================================================================
+
+def calculate_rpm_from_wind_speed(v_wind, radius, tip_speed_ratio):
+    """Beregn RPM fra vindhastighed"""
+    if v_wind == 0:
+        return 0
+    return (tip_speed_ratio * v_wind) / radius * 60 / (2 * PI)
+
+def calculate_mechanical_power(v_wind, radius, rho, cp):
+    """Beregn mekanisk effekt: P = 0.5 * ρ * π * r² * v³ * Cp"""
+    return 0.5 * rho * PI * radius**2 * v_wind**3 * cp
+
+def calculate_rms_voltage(rpm, kv_value, gear_ratio_val):
+    """Beregn RMS spænding fra RPM"""
+    return (rpm * gear_ratio_val * kv_value) / np.sqrt(2)
+
+def calculate_electrical_power(p_mech, efficiency):
+    """Beregn elektrisk effekt"""
+    return p_mech * efficiency
+
+def calculate_rms_current(v_rms, v_drop, motor_resistance, p_mech):
+    """Beregn RMS strøm fra spænding, modstand OG tilgængelig effekt
+    
+    VIGTIG FYSIK: Strømmen er begrænset af BÅDE spænding OG tilgængelig mekanisk effekt!
+    
+    Ved HØJE gear ratios:
+    - V_gen er høj, så spændingen KUNNE drive høj strøm
+    - Men P_mech er begrænset → Vi kan ikke faktisk udtrække så meget effekt
+    - Derfor må strømmen begrænses af P_mech også
+    
+    To constraints:
+    1. Voltage constraint: I ≤ (V_gen - V_drop) / (2R)  [Ved matched load]
+    2. Power constraint: 2I²R + V_drop×I ≤ P_mech
+    
+    Vi tager minimum af de to for at finde den faktiske strøm.
+    """
+    if v_rms <= v_drop:
+        return 0  # Ikke nok spænding til at overvinde diode
+    
+    if p_mech <= 0:
+        return 0  # Ingen mekanisk effekt tilgængelig
+    
+    # Tilgængelig spænding efter diode
+    v_available = v_rms - v_drop
+    
+    # Constraint 1: VOLTAGE-LIMITED strøm (matched load impedance)
+    i_voltage_limited = v_available / (2 * motor_resistance)
+    
+    # Constraint 2: POWER-LIMITED strøm
+    # P_total = 2I²R + V_drop×I ≤ P_mech
+    # Dette er en kvadratisk ligning: 2R×I² + V_drop×I - P_mech = 0
+    # Løsning: I = (-V_drop + sqrt(V_drop² + 8R×P_mech)) / (4R)
+    discriminant = v_drop**2 + 8 * motor_resistance * p_mech
+    if discriminant < 0:
+        i_power_limited = 0
+    else:
+        i_power_limited = (-v_drop + np.sqrt(discriminant)) / (4 * motor_resistance)
+    
+    # Tag minimum af de to constraints - det er den faktiske strøm
+    i_rms = min(i_voltage_limited, i_power_limited)
+    
+    return max(0, i_rms)
+
+def calculate_copper_loss(i_rms, motor_resistance):
+    """Beregn I²R tab i motor ledninger (kobber tab)"""
+    return i_rms**2 * motor_resistance
+
+def calculate_power_after_diodes(v_rms, v_drop_val, i_rms, motor_resistance, p_mech):
+    """Beregn effekt efter dioder og kobber tab
+    
+    Nu med VOLTAGE-FIRST tilgang:
+    - Strømmen I beregnes fra V og R (ikke fra P!)
+    - P_load = I² × R_load (med matched load: R_load = R_internal)
+    - P_copper_loss = I² × R_internal
+    - P_diode_loss = V_drop × I
+    - P_total_extracted = P_load + P_copper_loss + P_diode_loss
+    
+    Hvis P_total_extracted < P_mech, kan den elektriske side ikke udtrække al
+    den mekaniske effekt. Dette er OK - resten går til friktion eller accelererer rotoren.
+    """
+    # Beregn tab
+    diode_loss = v_drop_val * i_rms
+    copper_loss = i_rms**2 * motor_resistance
+    
+    # Load effekt (med matched load: R_load = R_internal)
+    p_load = i_rms**2 * motor_resistance
+    
+    # Total elektrisk effekt udtrukket
+    p_total_extracted = p_load + copper_loss + diode_loss
+    
+    # Hvis vi prøver at udtrække mere end P_mech tillader, begrænses vi af P_mech
+    # (selvom dette sjældent sker med voltage-first approach)
+    p_total_extracted = min(p_total_extracted, p_mech)
+    
+    # Output til load (efter tab)
+    p_out = p_total_extracted - diode_loss - copper_loss
+    
+    return max(0, p_out)
+
+def calculate_loss_percentage(p_mech, p_elec_before_diodes, i_rms, v_drop, motor_resistance):
+    """Beregn energitab i procent og watt - beregner diode tab og I²R tab direkte
+    
+    Med VOLTAGE-FIRST tilgang:
+    - Strømmen I beregnes fra spænding og modstand (ikke fra effekt)
+    - Dette giver realistiske strømværdier selv ved lav RPM/spænding
+    - Tab beregnes fra denne strøm
+    - Med motor_efficiency = 100%, så p_elec_before_diodes = p_mech
+    """
+    if p_mech == 0 or p_elec_before_diodes == 0:
+        return 0, 0, 0, 0, 0
+    
+    # Diode tab i watt: P_diode = V_drop × I
+    diode_loss_watts = v_drop * i_rms
+    diode_loss_pct = (diode_loss_watts / p_elec_before_diodes) * 100
+    
+    # Kobber tab i watt: P_copper = I² × R
+    copper_loss_watts = i_rms**2 * motor_resistance
+    copper_loss_pct = (copper_loss_watts / p_elec_before_diodes) * 100
+    
+    return diode_loss_pct, copper_loss_pct, diode_loss_watts, copper_loss_watts
+
+def calculate_efficiency_at_windspeed(v_wind, radius, rho, cp, tsr, kv_val, gear_val, v_drop_val, motor_res):
+    """Beregn total nyttevirkning (P_out/P_mech) ved en given vindhastighed og konfiguration
+    
+    Bruges til at optimere gear ratio og TSR for maksimal effektivitet
+    """
+    # Beregn mekanisk effekt
+    p_mech = calculate_mechanical_power(v_wind, radius, rho, cp)
+    if p_mech == 0:
+        return 0
+    
+    # Beregn RPM
+    rpm = calculate_rpm_from_wind_speed(v_wind, radius, tsr)
+    if rpm == 0:
+        return 0
+    
+    # Beregn spænding
+    v_rms = calculate_rms_voltage(rpm, kv_val, gear_val)
+    
+    # Beregn strøm (voltage & power constrained)
+    i_rms = calculate_rms_current(v_rms, v_drop_val, motor_res, p_mech)
+    
+    # Beregn udgående effekt efter tab
+    p_out = calculate_power_after_diodes(v_rms, v_drop_val, i_rms, motor_res, p_mech)
+    
+    # Nyttevirkning
+    efficiency = (p_out / p_mech) * 100 if p_mech > 0 else 0
+    
+    return efficiency
+
+def optimize_gear_and_tsr(v_wind, radius, rho, cp, kv_val, v_drop_val, motor_res, 
+                          gear_min=1.0, gear_max=10.0, tsr_min=1.0, tsr_max=10.0):
+    """Find den bedste kombination af gear ratio og TSR for maksimal nyttevirkning
+    
+    Bruger en grid search over fornuftige områder
+    """
+    best_efficiency = -1  # Start med -1 så vi kan detektere hvis intet virker
+    best_gear = 2.0
+    best_tsr = 5.0
+    
+    # Første pass: Grov grid search
+    gear_values_coarse = np.arange(gear_min, gear_max + 0.5, 1.0)  # Step 1.0
+    tsr_values_coarse = np.arange(tsr_min, tsr_max + 0.5, 0.5)    # Step 0.5
+    
+    for gear in gear_values_coarse:
+        for tsr in tsr_values_coarse:
+            eff = calculate_efficiency_at_windspeed(
+                v_wind, radius, rho, cp, tsr, kv_val, gear, v_drop_val, motor_res
+            )
+            if eff > best_efficiency:
+                best_efficiency = eff
+                best_gear = gear
+                best_tsr = tsr
+    
+    # Hvis ingen god løsning fundet, returner med advarsel
+    if best_efficiency <= 0:
+        return best_gear, best_tsr, 0.0
+    
+    # Anden pass: Fin grid search omkring det bedste punkt
+    gear_fine_min = max(gear_min, best_gear - 1.5)
+    gear_fine_max = min(gear_max, best_gear + 1.5)
+    tsr_fine_min = max(tsr_min, best_tsr - 1.0)
+    tsr_fine_max = min(tsr_max, best_tsr + 1.0)
+    
+    gear_values_fine = np.arange(gear_fine_min, gear_fine_max + 0.1, 0.1)  # Step 0.1
+    tsr_values_fine = np.arange(tsr_fine_min, tsr_fine_max + 0.1, 0.1)    # Step 0.1
+    
+    for gear in gear_values_fine:
+        for tsr in tsr_values_fine:
+            eff = calculate_efficiency_at_windspeed(
+                v_wind, radius, rho, cp, tsr, kv_val, gear, v_drop_val, motor_res
+            )
+            if eff > best_efficiency:
+                best_efficiency = eff
+                best_gear = gear
+                best_tsr = tsr
+    
+    return best_gear, best_tsr, best_efficiency
+
+# =============================================================================
+# SESSION STATE INITIALIZATION
+# =============================================================================
 
 init_session_state(DEFAULTS)
 
@@ -330,6 +537,18 @@ if selected_preset != "Custom" and st.sidebar.button("✅ Anvend Preset"):
 
 st.sidebar.markdown("---")
 
+# Håndter optimerede værdier fra auto-optimering (INDEN widgets oprettes!)
+if "optimized_gear" in st.session_state and "optimized_tsr" in st.session_state:
+    st.session_state.gear_ratio = st.session_state.optimized_gear
+    st.session_state.tip_speed_ratio = st.session_state.optimized_tsr
+    # Ryd op i midlertidige variabler
+    del st.session_state.optimized_gear
+    del st.session_state.optimized_tsr
+    # Gem også success beskeden
+    if "optimization_message" in st.session_state:
+        st.sidebar.success(st.session_state.optimization_message)
+        del st.session_state.optimization_message
+
 # Session state for designer updates er initialiseret via DEFAULTS
 
 # Blade radius - use temporary result if available
@@ -401,7 +620,8 @@ tip_speed_ratio = st.sidebar.slider(
     value=float(st.session_state.tip_speed_ratio),
     step=0.1,
     key="tip_speed_ratio",
-    help=TOOLTIPS["tsr"]
+    help=TOOLTIPS["tsr"],
+    disabled=st.session_state.get("auto_optimize_enabled", False)
 )
 
 # TSR Feedback
@@ -432,7 +652,8 @@ gear_ratio = st.sidebar.slider(
     value=float(st.session_state.gear_ratio),
     step=0.5,
     key="gear_ratio",
-    help=TOOLTIPS["gear_ratio"]
+    help=TOOLTIPS["gear_ratio"],
+    disabled=st.session_state.get("auto_optimize_enabled", False)
 )
 
 st.sidebar.info("💡 **Gear forhold:** Hvis du gearer op (gear>1): RPM_motor = RPM_blade × gear, men Torque_motor = Torque_blade / gear. Effekt P_mech = Torque × ω forbliver konstant.")
@@ -474,6 +695,99 @@ st.sidebar.caption("💡 Måles mellem 2 faseteminaler (3-fase) eller mellem + o
 # Advarsel hvis modstand er for høj
 if motor_resistance > 1.0:
     st.sidebar.warning("⚠️ Høj modstand! Kan give store I²R tab og lav effektivitet.")
+
+# Auto-optimering af gear og TSR
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 Auto-optimering")
+auto_optimize = st.sidebar.checkbox(
+    "Auto-optimer gear & TSR",
+    value=st.session_state.get("auto_optimize_enabled", False),
+    key="auto_optimize_enabled",
+    help="Finder automatisk den bedste kombination af gear ratio og TSR for maksimal nyttevirkning ved valgt vindhastighed"
+)
+
+if auto_optimize:
+    target_wind_speed = st.sidebar.slider(
+        "Optimer ved vindhastighed [m/s]",
+        min_value=3.0,
+        max_value=15.0,
+        value=st.session_state.get("target_wind_speed", 10.0),
+        step=0.5,
+        key="target_wind_speed",
+        help="Den vindhastighed hvor gear og TSR optimeres for bedst nyttevirkning"
+    )
+    
+    if st.sidebar.button("🔍 Find optimale værdier", type="primary"):
+        with st.spinner("Optimerer gear ratio og TSR..."):
+            # Hent rho fra session_state hvis expander ikke er udvidet
+            rho_val = st.session_state.get("rho", RHO_DEFAULT)
+            temp_cp = st.session_state.designer_cp_hobby
+            
+            optimal_gear, optimal_tsr, max_eff = optimize_gear_and_tsr(
+                v_wind=target_wind_speed,
+                radius=radius,
+                rho=rho_val,
+                cp=temp_cp,
+                kv_val=kv,
+                v_drop_val=v_drop,
+                motor_res=motor_resistance,
+                gear_min=1.0,
+                gear_max=10.0,
+                tsr_min=1.0,
+                tsr_max=10.0
+            )
+            
+            # Test også nogle specifikke værdier for sammenligning
+            test_configs = [
+                (1.0, 5.0, "Meget lav gear"),
+                (2.0, 5.0, "Lav gear"),
+                (3.0, 6.0, "Moderat"),
+                (4.0, 7.0, "Høj gear"),
+                (5.0, 7.0, "Meget høj gear"),
+            ]
+            debug_results = []
+            for test_gear, test_tsr, label in test_configs:
+                test_eff = calculate_efficiency_at_windspeed(
+                    target_wind_speed, radius, rho_val, temp_cp, test_tsr, 
+                    kv, test_gear, v_drop, motor_resistance
+                )
+                # Beregn også spænding for debug
+                test_rpm = calculate_rpm_from_wind_speed(target_wind_speed, radius, test_tsr)
+                test_v = calculate_rms_voltage(test_rpm, kv, test_gear)
+                debug_results.append(f"  • {label}: G={test_gear:.1f}, TSR={test_tsr:.1f}, V={test_v:.2f}V → {test_eff:.1f}%")
+            
+            debug_info = "\n".join(debug_results)
+            
+            # Gem i midlertidige variabler (opdateres ved næste rerun INDEN widgets)
+            st.session_state.optimized_gear = optimal_gear
+            st.session_state.optimized_tsr = optimal_tsr
+            
+            # Opret besked med advarsel hvis effektivitet er lav
+            opt_rpm = calculate_rpm_from_wind_speed(target_wind_speed, radius, optimal_tsr)
+            opt_v = calculate_rms_voltage(opt_rpm, kv, optimal_gear)
+            
+            msg = f"✅ **Optimalt:** Gear={optimal_gear:.1f}x, TSR={optimal_tsr:.1f}\n"
+            msg += f"   → V_gen={opt_v:.2f}V, Nyttevirkning=**{max_eff:.1f}%** @ {target_wind_speed} m/s\n\n"
+            msg += f"**Test af forskellige gear ratios:**\n{debug_info}"
+            
+            if max_eff <= 0:
+                msg += "\n\n❌ **KRITISK:** Ingen effekt mulig! Mulige årsager:\n"
+                msg += f"  • V_gen={opt_v:.2f}V < V_drop={v_drop:.1f}V (diode blokerer alt!)\n"
+                msg += f"  • Løsning: Øg gear ratio MEGET eller brug motor med højere kv\n"
+            elif max_eff < 30:
+                msg += "\n\n⚠️ **Advarsel:** Lav nyttevirkning! Mulige årsager:\n"
+                msg += f"  • V_gen={opt_v:.2f}V er kun lidt over V_drop={v_drop:.1f}V\n"
+                msg += f"  • Øg gear ratio for højere spænding\n"
+                msg += f"  • Eller sænk motor modstand (nu: {motor_resistance:.2f}Ω)\n"
+                msg += f"  • Eller brug DC børste motor (lavere V_drop: 0.7V vs 1.4V)"
+            
+            st.session_state.optimization_message = msg
+            
+            # Rerun vil opdatere værdierne INDEN widgets oprettes
+            st.rerun()
+    
+    # Vis nuværende værdier (disabled sliders vises ovenfor)
+    st.sidebar.info(f"🔧 Nuværende: Gear = {st.session_state.gear_ratio:.1f}x, TSR = {st.session_state.tip_speed_ratio:.1f}")
 
 # Avancerede indstillinger
 st.sidebar.subheader("Avancerede Indstillinger")
@@ -800,62 +1114,6 @@ def generate_pdf_report(filename, turbine_data, results_df):
     buffer.seek(0)
     return buffer
 
-# Beregningsfunktioner
-def calculate_rpm_from_wind_speed(v_wind, radius, tip_speed_ratio):
-    """Beregn RPM fra vindhastighed"""
-    if v_wind == 0:
-        return 0
-    return (tip_speed_ratio * v_wind) / radius * 60 / (2 * PI)
-
-def calculate_mechanical_power(v_wind, radius, rho, cp):
-    """Beregn mekanisk effekt: P = 0.5 * ρ * π * r² * v³ * Cp"""
-    return 0.5 * rho * PI * radius**2 * v_wind**3 * cp
-
-def calculate_rms_voltage(rpm, kv_value, gear_ratio_val):
-    """Beregn RMS spænding fra RPM"""
-    return (rpm * gear_ratio_val * kv_value) / np.sqrt(2)
-
-def calculate_electrical_power(p_mech, efficiency):
-    """Beregn elektrisk effekt"""
-    return p_mech * efficiency
-
-def calculate_rms_current(p_elec, v_rms):
-    """Beregn RMS strøm"""
-    if v_rms == 0:
-        return 0
-    return p_elec / v_rms
-
-def calculate_copper_loss(i_rms, motor_resistance):
-    """Beregn I²R tab i motor ledninger (kobber tab)"""
-    return i_rms**2 * motor_resistance
-
-def calculate_power_after_diodes(v_rms, v_drop_val, i_rms, motor_resistance):
-    """Beregn effekt efter dioder og kobber tab: (V - V_drop) * I - I²R"""
-    v_effective = max(0, v_rms - v_drop_val)
-    p_after_diodes = v_effective * i_rms
-    # Træk I²R tab fra
-    copper_loss = calculate_copper_loss(i_rms, motor_resistance)
-    return max(0, p_after_diodes - copper_loss)
-
-def calculate_loss_percentage(p_mech, p_elec_before_diodes, i_rms, v_drop, motor_resistance):
-    """Beregn energitab i procent og watt - beregner diode tab og I²R tab direkte
-    
-    Nu med motor_efficiency = 100%, så p_elec_before_diodes = p_mech
-    Alle tab kommer fra diode og I²R
-    """
-    if p_mech == 0 or p_elec_before_diodes == 0:
-        return 0, 0, 0, 0, 0
-    
-    # Diode tab i watt: P_diode = V_drop × I
-    diode_loss_watts = v_drop * i_rms
-    diode_loss_pct = (diode_loss_watts / p_elec_before_diodes) * 100
-    
-    # Kobber tab i watt: P_copper = I² × R
-    copper_loss_watts = i_rms**2 * motor_resistance
-    copper_loss_pct = (copper_loss_watts / p_elec_before_diodes) * 100
-    
-    return diode_loss_pct, copper_loss_pct, diode_loss_watts, copper_loss_watts
-
 # FYSIK BEREGNINGSFUNKTIONER
 def calculate_torque(power, rpm):
     """Beregn moment/torque: M = P / ω, hvor ω = RPM * 2π / 60"""
@@ -1008,9 +1266,29 @@ if health_issues:
 else:
     st.sidebar.success("✅ Ingen problemer fundet!")
 
-# Estimeret effekt ved 10 m/s
-estimated_power_10ms = 0.5 * rho * PI * radius**2 * 10**3 * cp_for_analysis * motor_efficiency
-st.sidebar.metric("Estimeret effekt @ 10m/s", f"{estimated_power_10ms:.1f} W")
+# Estimeret effekt ved 10 m/s (med faktisk nyttevirkning efter tab!)
+p_mech_10ms = 0.5 * rho * PI * radius**2 * 10**3 * cp_for_analysis
+efficiency_10ms = calculate_efficiency_at_windspeed(
+    v_wind=10.0,
+    radius=radius,
+    rho=rho,
+    cp=cp_for_analysis,
+    tsr=tip_speed_ratio,
+    kv_val=kv,
+    gear_val=gear_ratio,
+    v_drop_val=v_drop,
+    motor_res=motor_resistance
+)
+estimated_power_10ms = p_mech_10ms * (efficiency_10ms / 100.0)
+
+# Vis både mekanisk og faktisk effekt
+col_a, col_b = st.sidebar.columns(2)
+with col_a:
+    st.metric("P_mech @ 10m/s", f"{p_mech_10ms:.0f} W", help="Mekanisk effekt (kun Cp)")
+with col_b:
+    st.metric("P_out @ 10m/s", f"{estimated_power_10ms:.0f} W", 
+              delta=f"{efficiency_10ms:.1f}%",
+              help="Faktisk effekt efter diode + I²R tab")
 
 st.sidebar.markdown("---")
 
@@ -1030,12 +1308,13 @@ rpm_data_betz = [calculate_rpm_from_wind_speed(v, radius, tip_speed_ratio) for v
 # Beregn RMS spænding for betz (bruges til at beregne strøm)
 v_rms_data_betz = [calculate_rms_voltage(rpm, kv, gear_ratio) for rpm in rpm_data_betz]
 
-# Beregn RMS strøm
-i_rms_data_betz = [calculate_rms_current(p_elec, v_rms) for p_elec, v_rms in zip(p_elec_before_diodes_betz, v_rms_data_betz)]
+# Beregn RMS strøm (VOLTAGE & POWER constrained!)
+i_rms_data_betz = [calculate_rms_current(v_rms, v_drop, motor_resistance, p_mech) 
+                   for v_rms, p_mech in zip(v_rms_data_betz, p_mech_betz)]
 
 # Beregn effekt efter dioder og kobber tab
-p_after_diodes_betz = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance) 
-                       for v_rms, i_rms in zip(v_rms_data_betz, i_rms_data_betz)]
+p_after_diodes_betz = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance, p_mech) 
+                       for v_rms, i_rms, p_mech in zip(v_rms_data_betz, i_rms_data_betz, p_mech_betz)]
 
 # Vælg mølletype til detaljeret analyse
 st.sidebar.subheader("Mølletype")
@@ -1061,9 +1340,11 @@ else:
 # Beregn udgangdata for valgt mølle
 rpm_data = [calculate_rpm_from_wind_speed(v, radius, tip_speed_ratio) for v in wind_speeds]
 v_rms_data = [calculate_rms_voltage(rpm, kv, gear_ratio) for rpm in rpm_data]
-i_rms_data = [calculate_rms_current(p_elec, v_rms) for p_elec, v_rms in zip(p_elec_before_selected, v_rms_data)]
-p_diodes_data = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance) 
-                 for v_rms, i_rms in zip(v_rms_data, i_rms_data)]
+# Beregn RMS strøm (VOLTAGE & POWER constrained!)
+i_rms_data = [calculate_rms_current(v_rms, v_drop, motor_resistance, p_mech) 
+              for v_rms, p_mech in zip(v_rms_data, p_mech_selected)]
+p_diodes_data = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resistance, p_mech) 
+                 for v_rms, i_rms, p_mech in zip(v_rms_data, i_rms_data, p_mech_selected)]
 
 # Beregn energitab (diode og I²R tab)
 diode_losses = []
