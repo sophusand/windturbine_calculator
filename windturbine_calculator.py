@@ -390,8 +390,12 @@ else:
     st.sidebar.info("ℹ️ Lav Cp - typisk for simple designs")
 
 st.sidebar.subheader("Elektriske Konstanter")
+
+# Note om motor efficiency
+st.sidebar.info("⚠️ **Note:** Motor nyttevirkning varierer i virkeligheden med RPM og belastning (torque). Slideren nedenfor er en forenkling som antager konstant efficiency.")
+
 motor_efficiency = st.sidebar.slider(
-    "Motors MPP nyttevirkning (%)",
+    "Motors MPP nyttevirkning (%) - Forenkling",
     min_value=10,
     max_value=99,
     value=int(st.session_state.motor_efficiency_pct),
@@ -447,6 +451,8 @@ gear_ratio = st.sidebar.slider(
     key="gear_ratio",
     help=TOOLTIPS["gear_ratio"]
 )
+
+st.sidebar.info("💡 **Gear forhold:** Hvis du gearer op (gear>1): RPM_motor = RPM_blade × gear, men Torque_motor = Torque_blade / gear. Effekt P_mech = Torque × ω forbliver konstant.")
 
 # Motortype valg
 motor_type = st.sidebar.radio(
@@ -842,22 +848,23 @@ def calculate_power_after_diodes(v_rms, v_drop_val, i_rms, motor_resistance):
     return max(0, p_after_diodes - copper_loss)
 
 def calculate_loss_percentage(p_mech, p_elec_before_diodes, i_rms, v_drop, motor_resistance):
-    """Beregn energitab i procent - beregner diode tab og I²R tab direkte"""
+    """Beregn energitab i procent og watt - beregner diode tab og I²R tab direkte"""
     if p_mech == 0:
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
     
     # Motor tab: forskel mellem mekanisk og elektrisk effekt
-    motor_loss = ((p_mech - p_elec_before_diodes) / p_mech) * 100
+    motor_loss_watts = p_mech - p_elec_before_diodes
+    motor_loss_pct = (motor_loss_watts / p_mech) * 100
     
     # Diode tab i watt: P_diode = V_drop × I
     diode_loss_watts = v_drop * i_rms
-    diode_loss_pct = (diode_loss_watts / p_mech) * 100
+    diode_loss_pct = (diode_loss_watts / p_elec_before_diodes) * 100 if p_elec_before_diodes > 0 else 0
     
     # Kobber tab i watt: P_copper = I² × R
     copper_loss_watts = i_rms**2 * motor_resistance
-    copper_loss_pct = (copper_loss_watts / p_mech) * 100
+    copper_loss_pct = (copper_loss_watts / p_elec_before_diodes) * 100 if p_elec_before_diodes > 0 else 0
     
-    return motor_loss, diode_loss_pct, copper_loss_pct
+    return motor_loss_pct, diode_loss_pct, copper_loss_pct, motor_loss_watts, diode_loss_watts, copper_loss_watts
 
 # FYSIK BEREGNINGSFUNKTIONER
 def calculate_torque(power, rpm):
@@ -1072,9 +1079,12 @@ p_diodes_data = [calculate_power_after_diodes(v_rms, v_drop, i_rms, motor_resist
 motor_losses = []
 diode_losses = []
 copper_losses = []
+motor_losses_watts = []
+diode_losses_watts = []
+copper_losses_watts = []
 for i, v in enumerate(wind_speeds):
     # Beregn tab direkte fra strøm, spænding og modstand
-    m_loss, d_loss, c_loss = calculate_loss_percentage(
+    m_loss, d_loss, c_loss, m_watts, d_watts, c_watts = calculate_loss_percentage(
         p_mech_selected[i], 
         p_elec_before_selected[i], 
         i_rms_data[i], 
@@ -1084,6 +1094,9 @@ for i, v in enumerate(wind_speeds):
     motor_losses.append(m_loss)
     diode_losses.append(d_loss)
     copper_losses.append(c_loss)
+    motor_losses_watts.append(m_watts)
+    diode_losses_watts.append(d_watts)
+    copper_losses_watts.append(c_watts)
 
 # BEREGN FYSIK PARAMETRE
 # Torque beregninger
@@ -1216,37 +1229,48 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        fig_loss1 = go.Figure()
-        fig_loss1.add_trace(go.Bar(
+        # Beregn total tab i watt (diode + I²R)
+        total_losses_watts = [d + c for d, c in zip(diode_losses_watts, copper_losses_watts)]
+        
+        fig_loss_watts = go.Figure()
+        fig_loss_watts.add_trace(go.Scatter(
             x=wind_speeds,
-            y=motor_losses,
-            name='Motor tab (%)',
-            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Motor tab</b>: %{y:.2f}%<extra></extra>'
+            y=diode_losses_watts,
+            mode='lines+markers',
+            name='P tab diode [W]',
+            line=dict(width=3),
+            marker=dict(size=8),
+            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Diode tab</b>: %{y:.2f} W<extra></extra>'
         ))
-        fig_loss1.add_trace(go.Bar(
+        fig_loss_watts.add_trace(go.Scatter(
             x=wind_speeds,
-            y=diode_losses,
-            name='Diode tab (%)',
-            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Diode tab</b>: %{y:.2f}%<extra></extra>'
+            y=copper_losses_watts,
+            mode='lines+markers',
+            name='P tab I²R [W]',
+            line=dict(width=3),
+            marker=dict(size=8),
+            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>I²R tab</b>: %{y:.2f} W<extra></extra>'
         ))
-        fig_loss1.add_trace(go.Bar(
+        fig_loss_watts.add_trace(go.Scatter(
             x=wind_speeds,
-            y=copper_losses,
-            name='I²R Kobber tab (%)',
-            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Kobber tab</b>: %{y:.2f}%<extra></extra>'
+            y=total_losses_watts,
+            mode='lines+markers',
+            name='P tab total [W]',
+            line=dict(width=4, dash='dash'),
+            marker=dict(size=10),
+            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Total tab</b>: %{y:.2f} W<extra></extra>'
         ))
-        fig_loss1.update_layout(
-            title=f'Energitab for {turbine_name} mølle',
+        fig_loss_watts.update_layout(
+            title=f'Effekttab i Watt for {turbine_name} mølle',
             xaxis_title='Vindhastighed [m/s]',
-            yaxis_title='Energitab [%]',
+            yaxis_title='Effekttab [W]',
             height=500,
-            barmode='group',
             hovermode='x unified'
         )
-        st.plotly_chart(fig_loss1, use_container_width=True)
+        st.plotly_chart(fig_loss_watts, use_container_width=True)
     
     with col2:
-        # Effektivitet over tid
+        # Total nyttevirkning (fra P_mech til P_final efter alle tab)
         efficiency_total = []
         for p_mech, p_after in zip(p_mech_selected, p_diodes_data):
             if p_mech > 0:
@@ -1259,18 +1283,18 @@ with tab1:
             x=wind_speeds,
             y=efficiency_total,
             mode='lines+markers',
-            name='Effektivitet',
+            name='Total Nyttevirkning',
             fill='tozeroy',
             line=dict(color='green', width=3),
             marker=dict(size=8),
-            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Effektivitet</b>: %{y:.2f}%<extra></extra>'
+            hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Nyttevirkning</b>: %{y:.2f}%<extra></extra>'
         ))
         fig_eff.update_layout(
-            title=f'Samlet Effektivitet for {turbine_name} mølle',
+            title=f'Total Nyttevirkning for {turbine_name} mølle',
             xaxis_title='Vindhastighed [m/s]',
-            yaxis_title='Samlet Effektivitet [%]',
+            yaxis_title='Total Nyttevirkning [%]',
             height=500,
-            yaxis=dict(range=[0, 100]),
+            yaxis=dict(range=[0, max(efficiency_total) * 1.1] if efficiency_total else [0, 100]),
             hovermode='x unified'
         )
         st.plotly_chart(fig_eff, use_container_width=True)
@@ -1594,6 +1618,9 @@ with tab4:
         'P_mech [W]': [f"{p:.1f}" for p in p_mech_selected],
         'M [Nm]': [f"{t:.3f}" for t in torques_selected],
         'P_elec [W]': [f"{p:.1f}" for p in p_elec_before_selected],
+        'P_diode_tab [W]': [f"{d:.2f}" for d in diode_losses_watts],
+        'P_I²R_tab [W]': [f"{c:.2f}" for c in copper_losses_watts],
+        'P_total_tab [W]': [f"{d+c:.2f}" for d, c in zip(diode_losses_watts, copper_losses_watts)],
         'Motor_loss [%]': [f"{m:.1f}" for m in motor_losses],
         'Diode_loss [%]': [f"{d:.1f}" for d in diode_losses],
         'I²R_loss [%]': [f"{c:.1f}" for c in copper_losses],
@@ -1629,6 +1656,7 @@ with tab4:
         if st.button("🔍 Hent Værdier"):
             idx = np.argmin(np.abs(wind_speeds - selected_wind))
             closest_wind = wind_speeds[idx]
+            total_tab_watts = diode_losses_watts[idx] + copper_losses_watts[idx]
             
             st.success(f"""
             **📍 Vindhastighed:** {closest_wind:.1f} m/s
@@ -1640,10 +1668,10 @@ with tab4:
             **🔌 RMS Spænding:** {v_rms_data[idx]:.2f} V  
             **⚡ RMS Strøm:** {i_rms_data[idx]:.3f} A
             
-            **📊 Motor tab:** {motor_losses[idx]:.1f}%  
-            **📊 Diode tab:** {diode_losses[idx]:.1f}%  
-            **📊 I²R Kobber tab:** {copper_losses[idx]:.1f}%  
-            **✅ Samlet effektivitet:** {efficiency_total[idx]:.1f}%
+            **📊 Diode tab:** {diode_losses[idx]:.1f}% ({diode_losses_watts[idx]:.2f} W)  
+            **📊 I²R Kobber tab:** {copper_losses[idx]:.1f}% ({copper_losses_watts[idx]:.2f} W)  
+            **📊 Total tab:** {total_tab_watts:.2f} W  
+            **✅ Samlet nyttevirkning:** {efficiency_total[idx]:.1f}%
             """)
     
     # Mølle sammenligning
