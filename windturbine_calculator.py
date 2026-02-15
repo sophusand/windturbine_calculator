@@ -1003,6 +1003,61 @@ fig3.update_layout(
 )
 st.plotly_chart(fig3, use_container_width=True)
 
+# Graf 4: Blade RPM og Motor RPM vs Vindhastighed
+st.subheader("RPM ved forskellige vindhastigheder")
+
+# Beregn motor RPM (påvirket af gear ratio)
+motor_rpm_data = [rpm * gear_ratio for rpm in rpm_data]
+
+fig_rpm = go.Figure()
+
+# Blade RPM
+fig_rpm.add_trace(go.Scatter(
+    x=wind_speeds,
+    y=rpm_data,
+    mode='lines+markers',
+    name='Blade RPM',
+    line=dict(color='teal', width=3),
+    marker=dict(size=10, symbol='circle'),
+    fill='tozeroy',
+    fillcolor='rgba(0, 128, 128, 0.2)',
+    hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Blade RPM</b>: %{y:.0f}<extra></extra>'
+))
+
+# Motor RPM
+fig_rpm.add_trace(go.Scatter(
+    x=wind_speeds,
+    y=motor_rpm_data,
+    mode='lines+markers',
+    name=f'Motor RPM (gear: {gear_ratio:.1f}x)',
+    line=dict(color='purple', width=3, dash='dash'),
+    marker=dict(size=10, symbol='diamond'),
+    hovertemplate='<b>Vindhastighed</b>: %{x:.1f} m/s<br><b>Motor RPM</b>: %{y:.0f}<extra></extra>'
+))
+
+# Tilføj referencelinje for typiske RPM grænser
+fig_rpm.add_hline(y=500, line_dash='dot', line_color='orange', 
+                   annotation_text='500 RPM', annotation_position='right')
+fig_rpm.add_hline(y=1000, line_dash='dot', line_color='red', 
+                   annotation_text='1000 RPM', annotation_position='right')
+
+fig_rpm.update_layout(
+    title=f'Blade og Motor omdrejningshastighed - {turbine_name} mølle',
+    xaxis_title='Vindhastighed [m/s]',
+    yaxis_title='Omdrejninger per minut [RPM]',
+    height=500,
+    hovermode='x unified',
+    showlegend=True,
+    legend=dict(
+        yanchor="top",
+        y=0.99,
+        xanchor="left",
+        x=0.01
+    )
+)
+
+st.plotly_chart(fig_rpm, use_container_width=True)
+
 # FYSIK OG FORMLER SEKTION
 st.markdown("---")
 st.header("Fysik & Formler")
